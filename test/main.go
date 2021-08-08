@@ -6,6 +6,7 @@ import (
 	"github.com/go-pg/pg"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -64,6 +65,16 @@ type searchParams struct {
 	Author string `pg:"author.author_name"`
 }
 
+type Users struct {
+	Id         int64      `pg:"id"`
+	Name        string    `pg:"name"`
+	Password    string    `pg:"password"`
+}
+type Roles struct {
+	Id   int64  `pg:"id"`
+	Role string `pg:"role"`
+}
+
 var db *pg.DB
 
 func main() {
@@ -76,6 +87,8 @@ func main() {
 	defer db.Close()
 
 	r := gin.Default()
+
+	r.Use(BasicAuth())
 
 	authorsApi := r.Group("api/authors")
 	authorsApi.GET("", allAuthors)
@@ -101,6 +114,19 @@ func main() {
 	bookApi.DELETE("", deleteBook)
 	bookApi.PUT("", updateBook)
 
+	userApi := r.Group("api/users")
+	userApi.GET("*id", getUser)
+	userApi.POST("", createUsers)
+	userApi.DELETE("", deleteUser)
+	userApi.PUT("", changePassword)
+
+	roleApi := r.Group("api/roles")
+	roleApi.GET("*id", getRoles)
+	roleApi.POST("", createRole)
+	roleApi.DELETE("", deleteRole)
+	roleApi.PUT("", changeRole)
+
+
 	r.POST("/api/rentbook", rentABook)
 	r.POST("/api/returnbook", returnBook)
 	r.POST("/api/rentalhistory", showHistory)
@@ -108,6 +134,224 @@ func main() {
 	r.Run() // listen and serve on 0.0.0.0:8080 (for windows "localhost:8080")
 
 }
+
+func changeRole(c *gin.Context) {
+
+	var role *Roles
+	err := c.Bind(&role)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error msg": err.Error(),
+		})
+		return
+	}
+	_, err = db.QueryOne(role, `UPDATE roles SET role = (?role) WHERE id = (?id) RETURNING *`, role)
+	if err == nil {
+		c.JSON(http.StatusOK, gin.H{
+			role.Role: "роль изменена",
+		})
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error msg": err.Error(),
+	})
+
+}
+
+func deleteRole(c *gin.Context) {
+
+
+	var role *Roles
+	err := c.Bind(&role)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error msg": err.Error()})
+		return
+	}
+
+	_, err = db.QueryOne(role, `DELETE FROM roles WHERE id = ? RETURNING *`, role.Id)
+	if err == nil {
+		c.JSON(http.StatusOK, gin.H{
+			role.Role : "удален",
+		})
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error msg": err.Error(),
+	})
+
+}
+
+func createRole(c *gin.Context) {
+
+	var role *Roles
+	err := c.Bind(&role)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error msg": err.Error(),
+		})
+		return
+	}
+	_, err = db.QueryOne(role, `
+		INSERT INTO roles (role) VALUES (?role) RETURNING *`, role)
+	if err == nil {
+		c.JSON(http.StatusOK, gin.H{
+			role.Role : "Роль успешно добавлена",
+		})
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error msg": err.Error(),
+	})
+
+}
+
+func getRoles(c *gin.Context) {
+
+	var role []Roles
+	id := c.Param("id")
+	id = strings.ReplaceAll(id, "/", "")
+	if id != "" {
+		_, err := db.Query(&role, `SELECT * FROM roles WHERE id = (?)`, id)
+		if err == nil {
+			c.JSON(http.StatusOK, role)
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error msg": err.Error(),
+		})
+		return
+	}
+	//err := c.Bind(&role)
+	//if err != nil {
+	//	c.JSON(http.StatusBadRequest, gin.H{"error msg": err.Error()})
+	//	return
+	//}
+	_, err := db.Query(&role, `SELECT * FROM roles`)
+	if err == nil {
+		c.JSON(http.StatusOK, role)
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error msg": err.Error(),
+	})
+
+}
+
+func changePassword(c *gin.Context) {
+
+	var user *Users
+	err := c.Bind(&user)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error msg": err.Error(),
+		})
+		return
+	}
+	_, err = db.QueryOne(user, `UPDATE users SET password = (?password) WHERE id = (?id) RETURNING *`, user)
+	if err == nil {
+		c.JSON(http.StatusOK, gin.H{
+			user.Name: "пароль изменен",
+		})
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error msg": err.Error(),
+	})
+}
+
+func deleteUser(c *gin.Context) {
+
+	var user *Users
+	err := c.Bind(&user)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error msg": err.Error()})
+		return
+	}
+	if user.Id == 1{
+		c.JSON(http.StatusBadRequest, gin.H{
+			"Невозможно удалить данного пользователя":"",
+		})
+		return
+	}
+	_, err = db.QueryOne(user, `DELETE FROM users WHERE id = ? RETURNING *`, user.Id)
+	if err == nil {
+		c.JSON(http.StatusOK, gin.H{
+			user.Name : "удален",
+		})
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error msg": err.Error(),
+	})
+}
+
+func createUsers(c *gin.Context) {
+
+		var user *Users
+		err := c.Bind(&user)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error msg": err.Error(),
+			})
+			return
+		}
+		_, err = db.QueryOne(user, `
+		INSERT INTO users (name, password) VALUES (?name,?password) RETURNING *`, user)
+		if err == nil {
+			c.JSON(http.StatusOK, gin.H{
+				user.Name : "успешно добавлен",
+			})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error msg": err.Error(),
+		})
+}
+
+func getUser(c *gin.Context) {
+
+		var user []Users
+	id := c.Param("id")
+	fmt.Println(id)
+	id = strings.ReplaceAll(id, "/", "")
+	if id != "" {
+		_, err := db.Query(&user, `SELECT * FROM users WHERE id = (?)`, id)
+		if err == nil {
+			c.JSON(http.StatusOK, user)
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error msg": err.Error(),
+		})
+		return
+	}
+		_, err := db.Query(&user, `SELECT * FROM users`)
+		if err == nil {
+			c.JSON(http.StatusOK, user)
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error msg": err.Error(),
+		})
+	}
+
+
+func BasicAuth() gin.HandlerFunc {
+
+	var user []Users
+	_, err := db.Query(&user, `SELECT * FROM users`)
+
+	if err != nil {
+		fmt.Println(err)
+	}
+	m:= make(map[string]string)
+	for _, v:= range user{
+		m[v.Name] = v.Password
+	}
+	fmt.Println(m)
+	return gin.BasicAuth(m)
+}
+
 
 func showHistory(c *gin.Context) {
 
@@ -289,93 +533,6 @@ func showBooks(c *gin.Context) {
 	})
 	return
 	}
-	//	switch params.Status {
-	//	case "Free":
-	//		if params.OrderBy == "Genre" {
-	//			_, err = db.Query(&book, `SELECT book_id,release_date,current_reader,name AS book, genre,author_name AS author FROM book
-	//INNER JOIN genre ON genre.genre_id = book.genre_id INNER JOIN author ON author.author_id = book.author_id WHERE current_reader IS NULL ORDER BY genre LIMIT 20 OFFSET (?)`, params.Offset)
-	//			if err == nil {
-	//				c.JSON(200, gin.H{
-	//					"result": book,
-	//					"params": params,
-	//				})
-	//				return
-	//			}
-	//			c.JSON(400, gin.H{
-	//				"error msg": err.Error(),
-	//			})
-	//			return
-	//		}
-	//		_, err = db.Query(&book, `SELECT book_id,release_date,current_reader,name AS book, genre,author_name AS author FROM book
-	//INNER JOIN genre ON genre.genre_id = book.genre_id INNER JOIN author ON author.author_id = book.author_id WHERE current_reader IS NULL ORDER BY author LIMIT 20 OFFSET (?)`, params.Offset)
-	//		if err == nil {
-	//			c.JSON(200, gin.H{
-	//				"result": book,
-	//				"params": params,
-	//			})
-	//			return
-	//		}
-	//		c.JSON(400, gin.H{
-	//			"error msg": err.Error(),
-	//		})
-	//	case "Rented":
-	//		if params.OrderBy == "Genre" {
-	//			_, err = db.Query(&book, `SELECT book_id,release_date,current_reader,name AS book, genre,author_name AS author FROM book
-	//INNER JOIN genre ON genre.genre_id = book.genre_id INNER JOIN author ON author.author_id = book.author_id WHERE current_reader IS NOT NULL ORDER BY genre LIMIT 20 OFFSET (?)`, params.Offset)
-	//			if err == nil {
-	//				c.JSON(200, gin.H{
-	//					"result": book,
-	//					"params": params,
-	//				})
-	//				return
-	//			}
-	//			c.JSON(400, gin.H{
-	//				"error msg": err.Error(),
-	//			})
-	//			return
-	//		}
-	//		_, err = db.Query(&book, `SELECT book_id,release_date,current_reader,name AS book, genre,author_name AS author FROM book
-	//INNER JOIN genre ON genre.genre_id = book.genre_id INNER JOIN author ON author.author_id = book.author_id WHERE current_reader IS NOT NULL ORDER BY author LIMIT 20 OFFSET (?)`, params.Offset)
-	//		if err == nil {
-	//			c.JSON(200, gin.H{
-	//				"result": book,
-	//				"params": params,
-	//			})
-	//			return
-	//		}
-	//		c.JSON(400, gin.H{
-	//			"error msg": err.Error(),
-	//		})
-	//	default:
-	//		if params.OrderBy == "Genre" {
-	//			_, err = db.Query(&book, `SELECT book_id,release_date,current_reader,name AS book, genre,author_name AS author FROM book
-	//INNER JOIN genre ON genre.genre_id = book.genre_id INNER JOIN author ON author.author_id = book.author_id ORDER BY genre LIMIT 20 OFFSET (?)`, params.Offset)
-	//			if err == nil {
-	//				c.JSON(200, gin.H{
-	//					"result": book,
-	//					"params": params,
-	//				})
-	//				return
-	//			}
-	//			c.JSON(400, gin.H{
-	//				"error msg": err.Error(),
-	//			})
-	//			return
-	//		}
-	//		_, err = db.Query(&book, `SELECT book_id,release_date,current_reader,name AS book, genre,author_name AS author FROM book
-	//INNER JOIN genre ON genre.genre_id = book.genre_id INNER JOIN author ON author.author_id = book.author_id ORDER BY author LIMIT 20 OFFSET (?)`, params.Offset)
-	//		if err == nil {
-	//			c.JSON(200, gin.H{
-	//				"result": book,
-	//				"params": params,
-	//			})
-	//			return
-	//		}
-	//		c.JSON(400, gin.H{
-	//			"error msg": err.Error(),
-	//		})
-	//	}
-
 
 func createBook(c *gin.Context) {
 	var book *Book
@@ -445,7 +602,6 @@ func allReaders(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error msg": err.Error()})
 		return
 	}
-
 	_, err = db.Query(&reader, `SELECT * FROM reader`)
 	if err == nil {
 		c.JSON(200, gin.H{
@@ -456,7 +612,6 @@ func allReaders(c *gin.Context) {
 	c.JSON(400, gin.H{
 		"error msg": err.Error(),
 	})
-
 }
 
 func createReader(c *gin.Context) {
@@ -547,9 +702,7 @@ func allGenres(c *gin.Context) {
 	string2 += "FROM genre"
 	_, err = db.Query(&genre, string2)
 	if err == nil {
-		c.JSON(400, gin.H{
-			"result": genre,
-		})
+		c.JSON(400, genre)
 		return
 	}
 	c.JSON(400, gin.H{
