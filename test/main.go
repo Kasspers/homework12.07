@@ -1,10 +1,15 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/go-pg/pg"
+	"github.com/golang-jwt/jwt"
+	"io/ioutil"
+	"mime/multipart"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +23,13 @@ type Author struct {
 type Genre struct {
 	GenreId int64  `pg:"genre_id"`
 	Genre   string `pg:"genre"`
+}
+
+type bookTokens struct {
+	Id			int64		`pg:"id"`
+	BookId        int64     `pg:"book_id"`
+	Token          string   `pg:"token"`
+	CreatedAt	time.Time	`pg:"created_at"`
 }
 
 type Reader struct {
@@ -34,6 +46,8 @@ type Book struct {
 	GenreId       int64     `pg:"genre_id"`
 	CurrentReader int64     `pg:"current_reader"`
 	ReleaseDate   time.Time `pg:"release_date"`
+	BookFilepath string `pg:"book_filepath"`
+	ImageFilepath string `pg:"image_filepath"`
 }
 
 type RentalHistory struct {
@@ -43,6 +57,7 @@ type RentalHistory struct {
 	RentalDate time.Time `pg:"rental_date"`
 	ReturnDate time.Time `pg:"return_date"`
 }
+
 type TimeIntervalsForHistory struct {
 	RentalDateFrom time.Time
 	RentalDateTo   time.Time
@@ -56,6 +71,7 @@ type bookSearch struct {
 	ReleaseDate   time.Time `pg:"release_date"`
 	Genre         string    `pg:"genre"`
 	CurrentReader int64     `pg:"current_reader"`
+	ImageFilepath string `pg:"image_filepath"`
 }
 
 type searchParams struct {
@@ -69,13 +85,27 @@ type Users struct {
 	Id         int64      `pg:"id"`
 	Name        string    `pg:"name"`
 	Password    string    `pg:"password"`
+	Role 		string 		`pg:"role"`
 }
 type Roles struct {
 	Id   int64  `pg:"id"`
 	Role string `pg:"role"`
 }
+type jwtRefreshClaims struct {
+	Id int64
+	jwt.StandardClaims
+}
+
+type jwtAccessClaims struct {
+	Id int64
+	User string
+	Role string
+	Pop string
+	jwt.StandardClaims
+}
 
 var db *pg.DB
+var jwtKey = []byte("testKey")
 
 func main() {
 
@@ -88,7 +118,10 @@ func main() {
 
 	r := gin.Default()
 
-	r.Use(BasicAuth())
+	r.POST("refresh", validateRefreshToken)
+	r.POST("login", login)
+
+	r.Use(verifyAccessToken)
 
 	authorsApi := r.Group("api/authors")
 	authorsApi.GET("", allAuthors)
@@ -126,13 +159,384 @@ func main() {
 	roleApi.DELETE("", deleteRole)
 	roleApi.PUT("", changeRole)
 
-
-	r.POST("/api/rentbook", rentABook)
+	//r.POST("/api/rentbook", rentABook)
 	r.POST("/api/returnbook", returnBook)
 	r.POST("/api/rentalhistory", showHistory)
+	r.POST("/save",saveFile)
+	r.GET("logout", logout)
+	r.POST("take-book", takeBook)
+	r.POST("load-book", loadBook)
 
 	r.Run() // listen and serve on 0.0.0.0:8080 (for windows "localhost:8080")
+}
 
+func loadBook(c *gin.Context){
+	var bookToken *bookTokens
+	err := c.Bind(&bookToken)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	_, err = db.QueryOne(bookToken, `SELECT * FROM book_load_tokens WHERE token = ?`, bookToken.Token)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	timeDifference := time.Now().Sub(bookToken.CreatedAt)
+	if timeDifference.Hours() > 1 {
+		c.JSON(http.StatusNotFound, gin.H{
+			"Время токена истекло" : "",
+		})
+		return
+	}
+	bookPath, err := queryLoadBook(bookToken.Token)
+	fmt.Println(timeDifference)
+	data, err := ioutil.ReadFile(bookPath)
+	fmt.Println(bookPath)
+	if err != nil {
+		fmt.Println("File reading error", err)
+		return
+	}
+	fmt.Println(c.Keys["id"])
+	readerId := c.Keys["id"].(int64)
+	fmt.Println(readerId)
+
+	err = rentABook(readerId,bookToken.BookId)
+	if err != nil {
+		fmt.Println("error", err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"байты книги" : data,
+	})
+	//if err := os.WriteFile("file.pdf", data, 0666); err != nil { проверка файла
+	//	log.Fatal(err)
+	//}
+}
+func queryLoadBook(token string) (bookPath string,err error) {
+	_, err = db.QueryOne(&bookPath, `SELECT book_filepath FROM book INNER JOIN book_load_tokens bl on bl.book_id = book.book_id WHERE token = ?`, token)
+	if err != nil {
+		fmt.Println("finduser err",err.Error())
+		return "", err
+	}
+	return bookPath, err
+}
+
+func takeBook(c *gin.Context) {
+	if c.Keys["role"] != "librarian"{
+		c.JSON(http.StatusBadRequest, gin.H{"Недостаточно прав": ""})
+		return}
+	var loadBooks *bookTokens
+	err := c.Bind(&loadBooks)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	loadBooks.Token, err = generateBookToken()
+	if err != nil {
+	c.JSON(http.StatusInternalServerError, gin.H{
+		"error": err.Error(),
+	})
+	return
+	}
+	_, err = db.QueryOne(loadBooks, `INSERT INTO book_load_tokens (token, book_id) VALUES (?token,?book_id) RETURNING *`, loadBooks)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"токен для закгрузки" : loadBooks.Token,
+	})
+}
+
+func logout(c *gin.Context) {
+	var id string
+	fmt.Println(c.Keys["id"])
+	_, err := db.QueryOne(&id, `DELETE FROM sessions WHERE user_id = ? RETURNING user_id`, c.Keys["id"])
+	if err == nil {
+		c.JSON(http.StatusOK, gin.H{
+			id : "удален",
+		})
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
+		"error msg": err.Error(),
+	})
+}
+
+func validateRefreshToken(c *gin.Context) {
+	var RefreshPar struct {
+		RefreshToken string `pg:"refresh_token"`
+	}
+	err := c.Bind(&RefreshPar)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	fmt.Println(RefreshPar)
+	fmt.Println(RefreshPar.RefreshToken)
+	user, err := findSession(RefreshPar.RefreshToken)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	accessToken, err := generateAccessToken(*user)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"accessToken": accessToken,
+		"refreshToken": RefreshPar.RefreshToken,
+	})
+}
+
+func findSession(refreshToken string) (*Users, error) {
+	var user Users
+	_, err := db.QueryOne(&user, `SELECT user_roles.user_id AS id, name, password, role FROM user_roles INNER JOIN roles r on r.id = user_roles.role_id INNER JOIN users u on u.id = user_roles.user_id INNER JOIN sessions s on s.user_id = user_roles.user_id WHERE refresh_token = ?`, refreshToken)
+	if err != nil {
+		fmt.Println("finduser err",err)
+		return nil, err
+	}
+	fmt.Println(user)
+	return &user, nil
+}
+
+
+func saveFile(c *gin.Context) {
+	type loginPar struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	var jsonAndFile struct {
+		login loginPar
+		fileData *multipart.FileHeader
+	}
+
+	err := c.Bind(&jsonAndFile.login)
+
+	//
+	//err = c.ShouldBindJSON(&loginPar)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	jsonAndFile.fileData, err = c.FormFile("file")
+	// The file cannot be received.
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"message": err.Error(),
+		})
+		return
+	}
+
+	filePath := "resources/" +jsonAndFile.fileData.Filename
+	//// File saved successfully. Return proper result
+	//c.JSON(http.StatusOK, gin.H{
+	//	"message": "Your file has been successfully uploaded.",
+	//	"json":loginPar,
+	//})
+	// Retrieve file information
+	//extension := filepath.Ext(file.Filename)
+	// Generate random file name for the new uploaded file so it doesn't override the old file with same name
+	//newFileName := uuid.New().String() + extension
+
+	// The file is received, so let's save it
+	if err := c.SaveUploadedFile(jsonAndFile.fileData, filePath); err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+			"message":err,
+		})
+		return
+	}
+	// File saved successfully. Return proper result
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Your file has been successfully uploaded.",
+		"json":jsonAndFile.fileData.Filename,
+		"12313":jsonAndFile.login,
+	})
+}
+
+func verifyAccessToken(c *gin.Context) {
+
+	authValue := c.GetHeader("Authorization")
+	arr := strings.Split(authValue, " ")
+	//fmt.Println(arr,"arr")
+	if len(arr) != 2 {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{})
+		return
+	}
+	//authType := strings.Trim(arr[0], "\n\r\t")
+	//fmt.Println(authType,"authtype")
+	//if strings.ToLower(authType) != strings.ToLower("Bearer") {
+	//	c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{})
+	//	return
+	//}
+	token := arr[1]
+	//fmt.Println(token,"token")
+	user, err := validateToken(token)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"Ошибка": err.Error()})
+		return
+	}
+	if user.Name == ""{
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"рефреш токен не авторизирует": ""})
+		return
+	}
+	c.Set("id", user.Id)
+	c.Set("username", user.Name)
+	c.Set("role", user.Role)
+	//c.Writer.Header().Set("Authorization", "Bearer "+token)
+	fmt.Println(c.Keys["username"])
+	c.Next()
+}
+
+func login(c *gin.Context) {
+
+	var loginPar struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	err := c.ShouldBindJSON(&loginPar)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "incorrect parameters",
+		})
+		return
+	}
+	user, err := findUser(&Users{
+		Name: loginPar.Username,
+		Password: loginPar.Password,
+	})
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error": fmt.Sprintf("Неправильный логин или пароль"),
+		})
+		return
+	}
+	fmt.Println(user)
+	accessToken, err := generateAccessToken(*user)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	refreshToken, err := generateRefreshToken(*user)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	err = startSession(user.Id,refreshToken)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"error": err.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"accessToken": accessToken,
+		"refreshToken": refreshToken,
+	})
+}
+
+func generateRefreshToken(user Users) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS512, jwtRefreshClaims{
+		StandardClaims: jwt.StandardClaims{
+			ExpiresAt: time.Now().Add(time.Hour * 24).Unix(),
+		},
+		Id: user.Id,
+	})
+	fmt.Println(token.Claims)
+	tokenString, err := token.SignedString(jwtKey)
+	if err != nil {
+		return "", err
+	}
+	return tokenString, nil
+}
+func generateBookToken() (string,error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS512, jwt.StandardClaims{
+		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString(jwtKey)
+	if err != nil {
+		return "", err
+	}
+	return tokenString, nil
+}
+
+func generateAccessToken(user Users) (string, error) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS512, jwtAccessClaims{
+		StandardClaims: jwt.StandardClaims{
+			ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		},
+		User: user.Name,
+		Role: user.Role,
+		Id: user.Id,
+	})
+	fmt.Println(token.Claims)
+	tokenString, err := token.SignedString(jwtKey)
+	if err != nil {
+		return "", err
+	}
+	return tokenString, nil
+}
+
+func validateToken(tokenString string) (*Users, error) {
+	var claims jwtAccessClaims
+	token, err := jwt.ParseWithClaims(tokenString, &claims, func(token *jwt.Token) (interface{}, error) {
+		_, ok := token.Method.(*jwt.SigningMethodHMAC)
+		if !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return jwtKey, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !token.Valid {
+		return nil, errors.New("invalid token")
+	}
+	return &Users{
+		Name: claims.User,
+		Role: claims.Role,
+		Id: claims.Id,
+	}, nil
+}
+
+func findUser(user *Users) (*Users, error) {
+	_, err := db.QueryOne(user, `SELECT user_id AS id, name, password, role FROM user_roles INNER JOIN roles r on r.id = user_roles.role_id INNER JOIN users u on u.id = user_roles.user_id WHERE name = ? AND password = ?`, user.Name,user.Password)
+	if err != nil {
+		fmt.Println("finduser err",err)
+		return nil, err
+	}
+	fmt.Println(user)
+	return user, nil
+}
+
+func startSession (id int64, token string) error {
+	_, err := db.Exec(`INSERT INTO sessions (user_id, refresh_token) values (?,?)`, id,token)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func changeRole(c *gin.Context) {
@@ -160,7 +564,6 @@ func changeRole(c *gin.Context) {
 
 func deleteRole(c *gin.Context) {
 
-
 	var role *Roles
 	err := c.Bind(&role)
 	if err != nil {
@@ -178,7 +581,6 @@ func deleteRole(c *gin.Context) {
 	c.JSON(http.StatusBadRequest, gin.H{
 		"error msg": err.Error(),
 	})
-
 }
 
 func createRole(c *gin.Context) {
@@ -206,7 +608,6 @@ func createRole(c *gin.Context) {
 }
 
 func getRoles(c *gin.Context) {
-
 	var role []Roles
 	id := c.Param("id")
 	id = strings.ReplaceAll(id, "/", "")
@@ -400,43 +801,30 @@ func returnBook(c *gin.Context) {
 
 }
 
-func rentABook(c *gin.Context) {
-	var book *Book
-	var history []*RentalHistory
+func rentABook(readerId int64, bookId int64) error{
 
-	err := c.Bind(&book)
-
+	_, err := db.Exec(`BEGIN`)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error msg": err.Error()})
-		return
+		return err
 	}
 
-	_, err = db.Exec(`BEGIN`)
+	_, err = db.Exec(`UPDATE book SET current_reader = (?) WHERE book_id = (?)`, readerId,bookId)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error msg": err.Error()})
-		return
+		return err
 	}
 
-	_, err = db.QueryOne(book, `UPDATE book SET current_reader = (?current_reader) WHERE book_id = (?book_id)`, book)
+	_, err = db.Exec(`
+		INSERT INTO rental_history (reader_id,book_id) VALUES (?,?)`, readerId, bookId)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error msg": err.Error()})
-		return
-	}
-
-	_, err = db.QueryOne(&history, `
-		INSERT INTO rental_history (reader_id,book_id) VALUES (?,?) RETURNING rental_id`, book.CurrentReader, book.BookId)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error msg": err.Error()})
-		return
+		return err
 	}
 
 	_, err = db.Exec(`COMMIT`)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error msg": err.Error()})
-		return
+		return err
 	}
-	c.JSON(http.StatusOK, gin.H{"result": history})
-	return
+	fmt.Println(readerId, " c книгой ", bookId, " добавлен")
+	return nil
 }
 
 func updateBook(c *gin.Context) {
@@ -483,6 +871,11 @@ func deleteBook(c *gin.Context) {
 }
 
 func showBooks(c *gin.Context) {
+
+	if c.Keys["role"] != "librarian"{
+		c.JSON(http.StatusBadRequest, gin.H{"Недостаточно прав": ""})
+		return}
+
 	var book []*bookSearch
 	var params searchParams
 	var err error
@@ -496,7 +889,7 @@ func showBooks(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error msg": err.Error()})
 			return}
 	}
-	mainQueryBody := "SELECT book_id,release_date,current_reader,name AS book, genre,author_name AS author FROM book INNER JOIN genre ON genre.genre_id = book.genre_id INNER JOIN author ON author.author_id = book.author_id"
+	mainQueryBody := "SELECT book_id,release_date,current_reader,name AS book, genre,author_name AS author, image_filepath FROM book INNER JOIN genre ON genre.genre_id = book.genre_id INNER JOIN author ON author.author_id = book.author_id"
 	queryEnd := " LIMIT 20 OFFSET (?offset)"
 
 	if params.Author != "" || params.Status != "" {
@@ -535,19 +928,76 @@ func showBooks(c *gin.Context) {
 	}
 
 func createBook(c *gin.Context) {
-	var book *Book
-	err := c.Bind(&book)
-	if err != nil {
-		panic(err)
+	var bookAndFiles struct {
+		book Book
+		bookFile  *multipart.FileHeader
+		bookImage *multipart.FileHeader
 	}
-	//if book.CurrentReader == nil{} если нет читателя
-	_, err = db.QueryOne(book, `
-		INSERT INTO book (name,author_id,genre_id,release_date) VALUES (?name,?author_id,?genre_id,?release_date) RETURNING book_id`, book)
-	if err == nil {
-		c.String(200, fmt.Sprint(book.BookId, " ", book.Name, " добавлен успешно"))
+
+	err := c.Bind(&bookAndFiles.book)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+		})
 		return
 	}
-	c.JSON(400, gin.H{
+	fmt.Println(&bookAndFiles)
+	bookAndFiles.bookFile, err = c.FormFile("book")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"message": err.Error(),
+		})
+		return
+	}
+
+	filePathForBook := "nginx-1.21.1/resources/books/" + bookAndFiles.bookFile.Filename
+	bookAndFiles.bookImage, err = c.FormFile("image")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"message": err.Error(),
+		})
+		return
+	}
+
+	filePathForImage := "nginx-1.21.1/resources/images/" + bookAndFiles.bookImage.Filename
+
+	if strings.ToLower(filepath.Ext(bookAndFiles.bookFile.Filename)) != ".pdf"{
+		c.JSON(http.StatusBadRequest, gin.H{
+			"Неверный формат файла книги": "",
+		})
+		return
+	}
+	if strings.ToLower(filepath.Ext(bookAndFiles.bookImage.Filename)) !=".jpg"{
+		c.JSON(http.StatusBadRequest, gin.H{
+			"Неверный формат файла обложки книги": "",
+		})
+		return
+	}
+	if err := c.SaveUploadedFile(bookAndFiles.bookImage, filePathForImage); err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+			"message":err.Error(),
+		})
+		return
+	}
+
+	if err := c.SaveUploadedFile(bookAndFiles.bookFile, filePathForBook); err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+			"message":err.Error(),
+		})
+		return
+	}
+	bookAndFiles.book.BookFilepath = filePathForBook
+	bookAndFiles.book.ImageFilepath = filePathForImage
+	_, err = db.QueryOne(&bookAndFiles.book, `
+		INSERT INTO book (name,author_id,genre_id,release_date,book_filepath,image_filepath) VALUES (?name,?author_id,?genre_id,?release_date,?book_filepath,?image_filepath)`, bookAndFiles.book)
+	if err == nil {
+		c.JSON(http.StatusOK, gin.H{
+			bookAndFiles.book.Name: "Книга добавлена успешно",
+			filePathForImage:filePathForBook,
+		})
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{
 		"error msg": err.Error(),
 	})
 }
@@ -581,9 +1031,6 @@ func deleteReader(c *gin.Context) {
 	}
 	_, err = db.QueryOne(reader, `DELETE FROM reader r WHERE r.reader_id = ? AND NOT EXISTS 
 (SELECT 1 FROM book b WHERE r.reader_id = b.current_reader AND r.reader_id = ?) RETURNING *`, reader.ReaderId, reader.ReaderId)
-	//if err.Error() == "pg: no rows in result set"{
-	//	c.String(200, fmt.Sprint("Такого жанра не существует/Нельзя удалить жанр с существующими книгами"))
-	//	return}
 	if err == nil {
 		c.String(200, fmt.Sprint(reader.ReaderId, " ", reader.Name, " удален успешно"))
 		return
@@ -746,24 +1193,6 @@ func deleteAuthor(c *gin.Context) {
 		"error msg": err.Error(),
 	})
 }
-
-//
-//func deleteAuthor(c *gin.Context) {
-//	var authorID *Author
-//	err := c.Bind(&authorID)
-//	if err != nil {
-//		c.JSON(400, gin.H{
-//			"error msg": err.Error(),
-//		})
-//	}
-//	_, err = db.QueryOne(authorID, `DELETE FROM author WHERE author_id = ? RETURNING *` , authorID.AuthorId)
-//	if err == nil{
-//		c.String(200, fmt.Sprint(authorID.AuthorId," ",authorID.AuthorName, " удален успешно"))
-//		return}
-//	c.JSON(400, gin.H{
-//		"error msg": err.Error(),
-//	})
-//}
 
 func createAuthor(c *gin.Context) {
 
